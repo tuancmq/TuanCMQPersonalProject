@@ -1,0 +1,336 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using ClosedXML.Excel;
+using Microsoft.Extensions.Configuration;
+
+#region Data Models
+public class AppSettings
+{
+    public string? AceBinPath { get; set; }
+    public ComparisonSettings? SourceCode { get; set; }
+}
+
+public class ComparisonSettings
+{
+    public string? StagingFolderRoot { get; set; }
+}
+
+public class ExtractedProperty
+{
+    public string AppName { get; set; } = string.Empty;
+    public string Key { get; set; } = string.Empty;
+    public string Value { get; set; } = string.Empty;
+    public string Source { get; set; } = "BAR Property"; // Phân biệt nguồn: BAR Property hoặc ESQL Runtime
+}
+#endregion
+
+public class UrlExtractor
+{
+    private static AppSettings? _settings;
+
+    public static async Task Main(string[] args)
+    {
+        Console.OutputEncoding = Encoding.UTF8;
+        if (!LoadConfiguration()) return;
+
+        WriteMessage(ConsoleColor.Green, "Bắt đầu quá trình trích xuất URL/URLSpecifier sau khi override...");
+
+        try
+        {
+            var stagingRoot = _settings!.SourceCode!.StagingFolderRoot!;
+            WriteMessage(ConsoleColor.Cyan, $"Quét các repo con trong thư mục: {stagingRoot}");
+            var appNames = DiscoverAppsFromDirectory(stagingRoot);
+
+            if (!appNames.Any())
+            {
+                WriteMessage(ConsoleColor.Yellow, "Không tìm thấy thư mục repo con nào.");
+                return;
+            }
+
+            WriteMessage(ConsoleColor.Cyan, $"Tìm thấy {appNames.Count} repo. Bắt đầu xử lý song song...");
+
+            var allProperties = await ExtractPropertiesFromApps(appNames);
+
+            if (!allProperties.Any())
+            {
+                WriteMessage(ConsoleColor.Yellow, "Không trích xuất được property nào.");
+                return;
+            }
+
+            string outputFileName = $"WebServiceURLs_{DateTime.Now:yyyyMMdd_HHmmss}.xlsx";
+            string outputFilePath = Path.Combine(AppContext.BaseDirectory, outputFileName);
+
+            ExportToExcel(allProperties, outputFilePath);
+
+            WriteMessage(ConsoleColor.Green, $"\n🎉 HOÀN TẤT! 🎉\nĐã xuất thành công {allProperties.Count} properties ra file Excel tại:");
+            WriteMessage(ConsoleColor.White, $"   {outputFilePath}");
+
+            Process.Start(new ProcessStartInfo(outputFilePath) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            WriteMessage(ConsoleColor.Red, $"\nLỗi nghiêm trọng: {ex.Message}");
+            WriteMessage(ConsoleColor.DarkGray, ex.StackTrace ?? "No stack trace available.");
+        }
+    }
+
+    /// <summary>
+    /// Tự động tìm tất cả các thư mục con cấp 1 trong một đường dẫn.
+    /// Mỗi thư mục con được coi là một application/repository.
+    /// </summary>
+    private static List<string> DiscoverAppsFromDirectory(string rootPath)
+    {
+        if (!Directory.Exists(rootPath))
+        {
+            throw new DirectoryNotFoundException($"Thư mục gốc '{rootPath}' không tồn tại.");
+        }
+
+        return Directory.GetDirectories(rootPath)
+                        .Select(Path.GetFileName)
+                        .Where(dirName => dirName != null && !dirName.StartsWith(".")) // Bỏ qua các thư mục ẩn như .git
+                        .Cast<string>()
+                        .OrderBy(name => name)
+                        .ToList();
+    }
+
+    private static async Task<List<ExtractedProperty>> ExtractPropertiesFromApps(List<string> appNames)
+    {
+        var tasks = appNames.Select(async appName =>
+        {
+            string stagingAppPath = Path.Combine(_settings!.SourceCode!.StagingFolderRoot!, appName);
+            return await GetOverriddenPropertiesForApp(appName, stagingAppPath);
+        });
+
+        var results = await Task.WhenAll(tasks);
+        return results.SelectMany(p => p).ToList();
+    }
+
+    private static async Task<IEnumerable<ExtractedProperty>> GetOverriddenPropertiesForApp(string appName, string stagingAppPath)
+    {
+        string? aceBinPath = _settings?.AceBinPath;
+        if (string.IsNullOrEmpty(aceBinPath))
+        {
+            WriteMessage(ConsoleColor.Red, "Lỗi: AceBinPath chưa được cấu hình.");
+            return Enumerable.Empty<ExtractedProperty>();
+        }
+
+        string tempDir = Path.Combine(Path.GetTempPath(), "UrlExtractor", Guid.NewGuid().ToString());
+        Directory.CreateDirectory(tempDir);
+
+        string tempBarPath = Path.Combine(tempDir, $"{appName}_temp.bar");
+        string finalBarPath = Path.Combine(tempDir, $"{appName}_final.bar");
+        string? overridePropertiesPath = FindFirstFile(stagingAppPath, "override.properties");
+
+        var scriptContent = new StringBuilder();
+        scriptContent.AppendLine("@echo off");
+        scriptContent.AppendLine($"call \"{Path.Combine(aceBinPath, "mqsiprofile.cmd")}\"");
+        scriptContent.AppendLine($"echo Packaging application...");
+        scriptContent.AppendLine($"ibmint package --input-path \"{stagingAppPath}\" --output-bar-file \"{tempBarPath}\" --compile-maps-and-schemas > nul 2>&1");
+
+        if (File.Exists(overridePropertiesPath))
+        {
+            scriptContent.AppendLine($"echo Applying overrides...");
+            scriptContent.AppendLine($"ibmint apply overrides \"{overridePropertiesPath}\" --input-bar-file \"{tempBarPath}\" --output-bar-file \"{finalBarPath}\" > nul 2>&1");
+        }
+        else
+        {
+            scriptContent.AppendLine($"echo No override.properties found, using original BAR...");
+            scriptContent.AppendLine($"move /Y \"{tempBarPath}\" \"{finalBarPath}\" > nul 2>&1");
+        }
+
+        scriptContent.AppendLine($"echo Reading final BAR file properties...");
+        scriptContent.AppendLine($"mqsireadbar -b \"{finalBarPath}\" -r");
+
+        string scriptPath = Path.Combine(tempDir, $"extract_{appName}.bat");
+        await File.WriteAllTextAsync(scriptPath, scriptContent.ToString());
+
+        var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = $"/c \"{scriptPath}\"",
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WorkingDirectory = aceBinPath
+            }
+        };
+
+        process.Start();
+        string output = await process.StandardOutput.ReadToEndAsync();
+        await process.WaitForExitAsync();
+
+        // 1. Lấy properties từ BAR file
+        var barProperties = new List<ExtractedProperty>();
+        var outputLines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+
+        foreach (var line in outputLines)
+        {
+            if (line.Contains("webServiceURL", StringComparison.OrdinalIgnoreCase) || line.Contains("URLSpecifier", StringComparison.OrdinalIgnoreCase))
+            {
+                var parts = line.Trim().Split('=', 2);
+                if (parts.Length == 2)
+                {
+                    barProperties.Add(new ExtractedProperty
+                    {
+                        AppName = appName,
+                        Key = parts[0].Trim(),
+                        Value = parts[1].Trim(),
+                        Source = "BAR Property"
+                    });
+                }
+            }
+        }
+
+        // 2. Lấy properties từ file ESQL
+        var esqlProperties = await ExtractPropertiesFromEsqlFiles(appName, stagingAppPath);
+
+        // 3. Gộp 2 danh sách lại
+        var allAppProperties = new List<ExtractedProperty>();
+        allAppProperties.AddRange(barProperties);
+        allAppProperties.AddRange(esqlProperties);
+
+        try { Directory.Delete(tempDir, true); } catch { }
+
+        if (allAppProperties.Any())
+        {
+            WriteMessage(ConsoleColor.Green, $"   -> {appName}: OK, tổng cộng trích xuất được {allAppProperties.Count} property.");
+        }
+        else
+        {
+            WriteMessage(ConsoleColor.Gray, $"   -> {appName}: Không tìm thấy property nào liên quan.");
+        }
+
+        return allAppProperties;
+    }
+
+    private static async Task<IEnumerable<ExtractedProperty>> ExtractPropertiesFromEsqlFiles(string appName, string appPath)
+    {
+        var esqlProperties = new List<ExtractedProperty>();
+        if (!Directory.Exists(appPath)) return esqlProperties;
+
+        var esqlFiles = Directory.EnumerateFiles(appPath, "*.esql", SearchOption.AllDirectories);
+
+        foreach (var filePath in esqlFiles)
+        {
+            var lines = await File.ReadAllLinesAsync(filePath);
+            foreach (var line in lines)
+            {
+                var trimmedLine = line.Trim();
+                if (string.IsNullOrEmpty(trimmedLine) || trimmedLine.StartsWith("--"))
+                {
+                    continue; // Bỏ qua dòng trống hoặc comment
+                }
+
+                if (trimmedLine.StartsWith("SET OutputLocalEnvironment", StringComparison.OrdinalIgnoreCase) &&
+                   (trimmedLine.Contains("WebServiceURL", StringComparison.OrdinalIgnoreCase) || trimmedLine.Contains("RequestURL", StringComparison.OrdinalIgnoreCase)))
+                {
+                    var parts = trimmedLine.Split('=', 2);
+                    if (parts.Length == 2)
+                    {
+                        esqlProperties.Add(new ExtractedProperty
+                        {
+                            AppName = appName,
+                            Key = parts[0].Trim(),
+                            Value = parts[1].Trim().TrimEnd(';'), // Lấy giá trị và bỏ dấu chấm phẩy ở cuối
+                            Source = "ESQL Runtime" // Đánh dấu đây là property từ ESQL
+                        });
+                    }
+                }
+            }
+        }
+
+        if (esqlProperties.Any())
+        {
+            WriteMessage(ConsoleColor.Cyan, $"    -> {appName}: Tìm thấy {esqlProperties.Count} URL được gán trong ESQL.");
+        }
+
+        return esqlProperties;
+    }
+
+    private static void ExportToExcel(List<ExtractedProperty> properties, string filePath)
+    {
+        using var workbook = new XLWorkbook();
+        var worksheet = workbook.Worksheets.Add("Overridden URLs");
+
+        worksheet.Cell(1, 1).Value = "Application Name";
+        worksheet.Cell(1, 2).Value = "Property Key";
+        worksheet.Cell(1, 3).Value = "Value / UDP Name";
+        worksheet.Cell(1, 4).Value = "Source";
+
+        var headerRow = worksheet.Row(1);
+        headerRow.Style.Font.Bold = true;
+        headerRow.Style.Fill.BackgroundColor = XLColor.LightGray;
+
+        int currentRow = 2;
+        foreach (var prop in properties.OrderBy(p => p.AppName).ThenByDescending(p => p.Source).ThenBy(p => p.Key))
+        {
+            worksheet.Cell(currentRow, 1).Value = prop.AppName;
+            worksheet.Cell(currentRow, 2).Value = prop.Key;
+            worksheet.Cell(currentRow, 3).Value = prop.Value;
+            worksheet.Cell(currentRow, 4).Value = prop.Source;
+
+            if (prop.Source == "ESQL Runtime")
+            {
+                worksheet.Row(currentRow).Style.Fill.BackgroundColor = XLColor.FromHtml("#FFC7CE");
+                worksheet.Row(currentRow).Style.Font.FontColor = XLColor.FromHtml("#9C0006");
+            }
+
+            currentRow++;
+        }
+
+        worksheet.Columns().AdjustToContents();
+        workbook.SaveAs(filePath);
+    }
+
+    #region Utility Methods
+    private static bool LoadConfiguration()
+    {
+        try
+        {
+            var configuration = new ConfigurationBuilder()
+                .SetBasePath(AppContext.BaseDirectory)
+                .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+                .Build();
+            _settings = configuration.GetSection("AppSettings").Get<AppSettings>();
+
+            if (_settings == null || string.IsNullOrEmpty(_settings.AceBinPath) ||
+                _settings.SourceCode == null ||
+                string.IsNullOrEmpty(_settings.SourceCode.StagingFolderRoot))
+            {
+                throw new Exception("File appsettings.json bị thiếu các cấu hình cần thiết (AceBinPath, SourceCode.StagingFolderRoot).");
+            }
+            return true;
+        }
+        catch (Exception ex)
+        {
+            WriteMessage(ConsoleColor.Red, $"Lỗi khi đọc file cấu hình: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static string? FindFirstFile(string rootPath, string fileName)
+    {
+        try
+        {
+            if (!Directory.Exists(rootPath)) return null;
+            return Directory.EnumerateFiles(rootPath, fileName, SearchOption.AllDirectories).FirstOrDefault();
+        }
+        catch { return null; }
+    }
+
+    private static void WriteMessage(ConsoleColor color, string message)
+    {
+        Console.ForegroundColor = color;
+        Console.WriteLine(message);
+        Console.ResetColor();
+    }
+    #endregion
+}
