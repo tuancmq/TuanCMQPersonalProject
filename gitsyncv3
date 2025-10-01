@@ -1,0 +1,413 @@
+{
+  "GitLab": {
+    "Url": "https://git.aws.platform.vpbank.dev",
+    // GroupId đã được di chuyển khỏi đây
+    "Token": "glpat-VSjUp1szyG8zymsmqtBs"
+  },
+  "SyncOptions": {
+    "SyncType": "ONE_FOLDER",
+    "MaxConcurrentTasks": 16
+  },
+  "Environments": {
+    "sit": {
+      "GroupId": "5286", // <--- Group ID cho môi trường SIT
+      "TargetPath": "D:\\2024\\cp4i\\sit",
+      "BranchName": "sit"
+    },
+    "uat": {
+      "GroupId": "5286", // <--- Group ID khác cho môi trường UAT
+      "TargetPath": "D:\\2024\\cp4i\\uat",
+      "BranchName": "uat"
+    },
+    "staging": {
+      "GroupId": "5286", // <--- Group ID khác cho môi trường STAGING
+      "TargetPath": "D:\\2024\\cp4i\\staging",
+      "BranchName": "staging"
+    },
+    "pre-staging": {
+      "GroupId": "5286", // <--- Group ID khác cho môi trường PRE-STAGING
+      "TargetPath": "D:\\2024\\cp4i\\pre-staging",
+      "BranchName": "pre-staging"
+    }
+  }
+}
+
+
+
+using LibGit2Sharp;
+using LibGit2Sharp.Handlers;
+using Microsoft.Extensions.Configuration;
+using Newtonsoft.Json.Linq;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+// ====================================================================================
+// CẢI TIẾN 1: SỬA LỖI FONT TIẾNG VIỆT TRÊN CONSOLE
+// ====================================================================================
+Console.OutputEncoding = Encoding.UTF8;
+// ====================================================================================
+
+
+// ====================================================================================
+// KHỞI TẠO VÀ ĐỌC CẤU HÌNH TỪ appsettings.json
+// ====================================================================================
+var builder = new ConfigurationBuilder()
+    .SetBasePath(AppContext.BaseDirectory)
+    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true);
+
+IConfiguration config = builder.Build();
+
+var gitLabUrl = config["GitLab:Url"];
+// var groupId = config["GitLab:GroupId"]; // THAY ĐỔI 1: Xóa dòng này
+var gitLabToken = config["GitLab:Token"];
+
+// Đọc cấu hình chung
+var syncType = Enum.Parse<SyncType>(config["SyncOptions:SyncType"] ?? "ONE_FOLDER");
+var maxConcurrentTasks = int.Parse(config["SyncOptions:MaxConcurrentTasks"] ?? "8");
+
+// Đọc tham số môi trường từ dòng lệnh (command line)
+if (args.Length == 0)
+{
+    Console.ForegroundColor = ConsoleColor.Red;
+    Console.WriteLine("❌ LỖI: Vui lòng cung cấp tên môi trường.");
+    Console.ResetColor();
+    Console.WriteLine("👉 Ví dụ: gitsyncv3 sit");
+    return;
+}
+var environmentKey = args[0];
+
+// THAY ĐỔI 2: Đọc cấu hình từ section môi trường cụ thể
+var envSection = config.GetSection($"Environments:{environmentKey}");
+var branchName = envSection["BranchName"];
+var targetPath = envSection["TargetPath"];
+var groupId = envSection["GroupId"]; // Đọc GroupId từ đây
+
+// Kiểm tra cấu hình có tồn tại không
+if (string.IsNullOrEmpty(branchName) || string.IsNullOrEmpty(targetPath) || string.IsNullOrEmpty(groupId))
+{
+    Console.ForegroundColor = ConsoleColor.Red;
+    Console.WriteLine($"❌ LỖI: Cấu hình chưa đầy đủ (BranchName, TargetPath, GroupId) cho môi trường '{environmentKey}'.");
+    var availableEnvs = config.GetSection("Environments").GetChildren().Select(c => c.Key);
+    Console.ResetColor();
+    Console.WriteLine($"Các môi trường có sẵn: {string.Join(", ", availableEnvs)}");
+    return;
+}
+
+// THAY ĐỔI 3: Cập nhật lại logic kiểm tra cấu hình GitLab chung
+if (string.IsNullOrEmpty(gitLabUrl) || string.IsNullOrEmpty(gitLabToken))
+{
+    Console.WriteLine("❌ LỖI NGHIÊM TRỌNG: Thiếu cấu hình GitLab (Url, Token) trong appsettings.json.");
+    return;
+}
+// ====================================================================================
+
+var stopwatch = Stopwatch.StartNew();
+Console.WriteLine("🚀 Bắt đầu quá trình đồng bộ GitSync...");
+// Hiển thị thông tin môi trường đang chạy
+Console.WriteLine($"Môi trường: {environmentKey.ToUpper()}");
+Console.WriteLine($"GitLab Group ID: {groupId}"); // <-- Thêm dòng này để xác nhận Group ID
+Console.WriteLine($"Kiểu đồng bộ: {syncType}");
+Console.WriteLine($"Thư mục đích: {targetPath}");
+Console.WriteLine($"Nhánh (Branch): {branchName}");
+Console.WriteLine("--------------------------------------------------");
+
+
+Directory.CreateDirectory(targetPath);
+
+var processingResults = new ConcurrentBag<ProcessResult>();
+
+using var client = new HttpClient { BaseAddress = new Uri(gitLabUrl) };
+client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", gitLabToken);
+client.DefaultRequestHeaders.Add("User-Agent", "GitSyncTool/5.0");
+
+try
+{
+    Console.WriteLine($"🔍 Waiting for GitLab... Đang lấy danh sách tất cả repositories từ Group ID: {groupId}...");
+    var allRepos = await GetAllRepositoriesAsync(client, groupId); // groupId giờ là biến cục bộ
+    if (!allRepos.Any())
+    {
+        Console.WriteLine("Không tìm thấy repository nào.");
+        return;
+    }
+
+    Console.WriteLine($"✅ Tìm thấy {allRepos.Count} repositories. Bắt đầu xử lý...");
+    Console.WriteLine();
+
+    using var semaphore = new SemaphoreSlim(maxConcurrentTasks);
+    var processingTasks = allRepos.Select(async repo =>
+    {
+        await semaphore.WaitAsync();
+        try
+        {
+            await CloneOrPullRepositoryAsync(repo);
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    });
+    await Task.WhenAll(processingTasks);
+}
+catch (Exception ex)
+{
+    Console.ForegroundColor = ConsoleColor.Red;
+    Console.WriteLine($"Một lỗi nghiêm trọng không mong muốn đã xảy ra: {ex.Message}");
+    Console.ResetColor();
+    processingResults.Add(new ProcessResult("FATAL_ERROR", ProcessStatus.Failed, ex.ToString()));
+}
+finally
+{
+    stopwatch.Stop();
+    DisplaySummaryTable(processingResults.ToList());
+    Console.WriteLine("--------------------------------------------------");
+    Console.WriteLine($"🎉 Quá trình hoàn tất.");
+    Console.WriteLine($"⏱ Tổng thời gian thực thi: {stopwatch.Elapsed.TotalSeconds:F2} giây.");
+}
+
+// Các hàm còn lại (GetAllRepositoriesAsync, CloneOrPullRepositoryAsync, DisplaySummaryTable, enums, record) không cần thay đổi.
+
+async Task<List<JObject>> GetAllRepositoriesAsync(HttpClient httpClient, string grpId)
+{
+    var repos = new List<JObject>();
+    var page = 1;
+    while (true)
+    {
+        var requestUri = $"/api/v4/groups/{grpId}/projects?per_page=100&page={page}&include_subgroups=true&with_shared=false&archived=false";
+        var response = await httpClient.GetAsync(requestUri);
+        response.EnsureSuccessStatusCode();
+        var pageRepos = JArray.Parse(await response.Content.ReadAsStringAsync());
+        if (pageRepos.Count == 0) break;
+        repos.AddRange(pageRepos.Cast<JObject>());
+        page++;
+    }
+    return repos;
+}
+
+Task CloneOrPullRepositoryAsync(JObject repoInfo)
+{
+    return Task.Run(() =>
+    {
+        string repoUrl = repoInfo["http_url_to_repo"]!.ToString();
+        string repoPathWithNamespace = repoInfo["path_with_namespace"]!.ToString();
+
+        string localRepoPath;
+        switch (syncType)
+        {
+            case SyncType.GITLAB_FOLDER:
+                localRepoPath = Path.Combine(targetPath, repoPathWithNamespace);
+                break;
+            case SyncType.ONE_FOLDER:
+            default:
+                localRepoPath = Path.Combine(targetPath, repoInfo["path"]!.ToString());
+                break;
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(localRepoPath)!);
+
+        var credentialsHandler = new CredentialsHandler((url, user, cred) => new UsernamePasswordCredentials { Username = "oauth2", Password = gitLabToken });
+        var signature = new Signature("GitSyncTool", "gitsync@tool.com", DateTimeOffset.Now);
+
+        try
+        {
+            if (Repository.IsValid(localRepoPath))
+            {
+                using var repo = new Repository(localRepoPath);
+
+                var status = repo.RetrieveStatus();
+                if (status.IsDirty)
+                {
+                    string message = "Skipped: Uncommitted changes detected.";
+                    Console.ForegroundColor = ConsoleColor.DarkYellow;
+                    Console.WriteLine($"⚠️  Bỏ qua '{repoPathWithNamespace}': Phát hiện có thay đổi chưa được commit.");
+                    Console.ResetColor();
+                    processingResults.Add(new ProcessResult(repoPathWithNamespace, ProcessStatus.LocalChanges, message));
+                    return;
+                }
+
+                if (repo.Head.TrackingDetails != null && repo.Head.TrackingDetails.AheadBy > 0)
+                {
+                    string message = $"Skipped: {repo.Head.TrackingDetails.AheadBy} unpushed commit(s) detected.";
+                    Console.ForegroundColor = ConsoleColor.DarkYellow;
+                    Console.WriteLine($"⚠️  Bỏ qua '{repoPathWithNamespace}': Phát hiện {repo.Head.TrackingDetails.AheadBy} commit chưa được push.");
+                    Console.ResetColor();
+                    processingResults.Add(new ProcessResult(repoPathWithNamespace, ProcessStatus.LocalChanges, message));
+                    return;
+                }
+
+                Console.WriteLine($"🔄 Đang kiểm tra cập nhật cho '{repoPathWithNamespace}'...");
+
+                var pullOptions = new PullOptions
+                {
+                    FetchOptions = new FetchOptions { CredentialsProvider = credentialsHandler, Prune = true },
+                    MergeOptions = new MergeOptions()
+                };
+
+                var result = Commands.Pull(repo, signature, pullOptions);
+
+                switch (result.Status)
+                {
+                    case MergeStatus.UpToDate:
+                        Console.WriteLine($"👍 '{repoPathWithNamespace}' đã ở phiên bản mới nhất.");
+                        processingResults.Add(new ProcessResult(repoPathWithNamespace, ProcessStatus.UpToDate, "Already up-to-date."));
+                        break;
+
+                    case MergeStatus.FastForward:
+                    case MergeStatus.NonFastForward:
+                        var successDetails = $"Pulled successfully. New commit: {result.Commit.Id.ToString(7)}";
+                        Console.WriteLine($"✅ Đã kéo (pull) thành công '{repoPathWithNamespace}'.");
+                        processingResults.Add(new ProcessResult(repoPathWithNamespace, ProcessStatus.Pulled, successDetails));
+                        break;
+
+                    case MergeStatus.Conflicts:
+                        string conflictMessage = "Merge conflict detected. Repo has been reset and skipped.";
+                        Console.ForegroundColor = ConsoleColor.Magenta;
+                        Console.WriteLine($"❗️ XUNG ĐỘT (CONFLICT) tại '{repoPathWithNamespace}'. Đang reset và bỏ qua.");
+                        Console.ResetColor();
+                        repo.Reset(ResetMode.Hard, repo.Head.Tip);
+                        processingResults.Add(new ProcessResult(repoPathWithNamespace, ProcessStatus.Conflict, conflictMessage));
+                        break;
+
+                    default:
+                        string otherError = $"Pull failed with unexpected status: {result.Status}";
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine($"❌ Thất bại '{repoPathWithNamespace}': {otherError}");
+                        Console.ResetColor();
+                        processingResults.Add(new ProcessResult(repoPathWithNamespace, ProcessStatus.Failed, otherError));
+                        break;
+                }
+            }
+            else
+            {
+                Console.WriteLine($"📥 Đang nhân bản (clone) '{repoPathWithNamespace}' (nhánh '{branchName}')...");
+                var cloneOptions = new CloneOptions
+                {
+                    BranchName = branchName,
+                    FetchOptions = { CredentialsProvider = credentialsHandler }
+                };
+
+                string resultPath = Repository.Clone(repoUrl, localRepoPath, cloneOptions);
+                Console.WriteLine($"✅ Đã nhân bản (clone) thành công '{repoPathWithNamespace}'.");
+                processingResults.Add(new ProcessResult(repoPathWithNamespace, ProcessStatus.Cloned, $"Cloned into {resultPath}"));
+            }
+        }
+        catch (LibGit2Sharp.NotFoundException)
+        {
+            string message = $"Skipped: Branch '{branchName}' not found.";
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"⚠️  Bỏ qua '{repoPathWithNamespace}': Không tìm thấy nhánh (branch) '{branchName}'.");
+            Console.ResetColor();
+            processingResults.Add(new ProcessResult(repoPathWithNamespace, ProcessStatus.Skipped, message));
+        }
+        catch (Exception ex)
+        {
+            string errorMessage = $"FAILED: {ex.GetType().Name} - {ex.Message.Trim()}";
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"❌ Thất bại '{repoPathWithNamespace}': {ex.Message.Trim()}");
+            Console.ResetColor();
+            processingResults.Add(new ProcessResult(repoPathWithNamespace, ProcessStatus.Failed, ex.Message.Trim()));
+        }
+    });
+}
+
+void DisplaySummaryTable(List<ProcessResult> results)
+{
+    if (!results.Any()) return;
+
+    var sortedResults = results.OrderBy(r => r.RepositoryPath).ToList();
+
+    Console.WriteLine();
+    Console.WriteLine("📊 BẢNG TỔNG HỢP KẾT QUẢ");
+    Console.WriteLine("========================");
+
+    int repoPathWidth = sortedResults.Select(r => r.RepositoryPath.Length).DefaultIfEmpty(10).Max() + 2;
+    int statusWidth = sortedResults.Select(r => r.Status.ToString().Length).DefaultIfEmpty(10).Max() + 2;
+
+    string header = $"| {"Repository".PadRight(repoPathWidth)} | {"Status".PadRight(statusWidth)} | Details";
+    Console.WriteLine(header);
+    Console.WriteLine($"|-{new string('-', repoPathWidth)}-|-{new string('-', statusWidth)}-|--------");
+
+    foreach (var result in sortedResults)
+    {
+        Console.Write($"| {result.RepositoryPath.PadRight(repoPathWidth)} ");
+        Console.Write($"| ");
+
+        switch (result.Status)
+        {
+            case ProcessStatus.Cloned:
+            case ProcessStatus.Pulled:
+                Console.ForegroundColor = ConsoleColor.Green;
+                break;
+            case ProcessStatus.UpToDate:
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                break;
+            case ProcessStatus.Conflict:
+                Console.ForegroundColor = ConsoleColor.Magenta;
+                break;
+            case ProcessStatus.Skipped:
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                break;
+            case ProcessStatus.LocalChanges:
+                Console.ForegroundColor = ConsoleColor.DarkYellow;
+                break;
+            case ProcessStatus.Failed:
+                Console.ForegroundColor = ConsoleColor.Red;
+                break;
+        }
+        Console.Write($"{result.Status.ToString().PadRight(statusWidth)}");
+        Console.ResetColor();
+        Console.WriteLine($" | {result.Details}");
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("📈 Thống kê:");
+    var summary = sortedResults.GroupBy(r => r.Status)
+                                     .Select(g => new { Status = g.Key, Count = g.Count() })
+                                     .OrderBy(x => x.Status);
+
+    foreach (var item in summary)
+    {
+        Console.WriteLine($"\t- {item.Status}: {item.Count}");
+    }
+
+    var conflictRepos = sortedResults.Where(r => r.Status == ProcessStatus.Conflict).ToList();
+    if (conflictRepos.Any())
+    {
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.Magenta;
+        Console.WriteLine("❗️ DANH SÁCH REPO BỊ XUNG ĐỘT (CONFLICT)");
+        Console.ResetColor();
+        Console.WriteLine("------------------------------------------");
+        foreach (var repo in conflictRepos)
+        {
+            Console.WriteLine($"- {repo.RepositoryPath}");
+        }
+    }
+
+    var localChangeRepos = sortedResults.Where(r => r.Status == ProcessStatus.LocalChanges).ToList();
+    if (localChangeRepos.Any())
+    {
+        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.DarkYellow;
+        Console.WriteLine("⚠️  DANH SÁCH REPO CẦN LƯU Ý (CÓ THAY ĐỔI CHƯA COMMIT/PUSH)");
+        Console.ResetColor();
+        Console.WriteLine("-------------------------------------------------------------");
+        foreach (var repo in localChangeRepos)
+        {
+            Console.WriteLine($"- {repo.RepositoryPath} ({repo.Details})");
+        }
+    }
+}
+
+
+public enum SyncType { ONE_FOLDER, GITLAB_FOLDER }
+public enum ProcessStatus { Cloned, Pulled, UpToDate, Skipped, Failed, Conflict, LocalChanges }
+public record ProcessResult(string RepositoryPath, ProcessStatus Status, string Details);
